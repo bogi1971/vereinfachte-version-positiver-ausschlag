@@ -3,13 +3,13 @@ name: VVPA Auto-Scanner
 on:
   schedule:
     # Alle 15 Minuten während Marktzeiten (9:30-16:00 EST)
-    - cron: '*/15 13-20 * * 1-5'  # Mo-Fr, 13:30-20:00 UTC
+    - cron: '*/15 13-20 * * 1-5'
   workflow_dispatch:
 
 jobs:
   vvpa-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 14  # Muss unter 15 Min bleiben
+    timeout-minutes: 14
     
     steps:
     - uses: actions/checkout@v3
@@ -30,4 +30,5 @@ jobs:
         MAX_PRICE: ${{ secrets.MAX_PRICE || '30.0' }}
         ALERT_THRESHOLD: ${{ secrets.ALERT_THRESHOLD || '5.0' }}
         MIN_VOLUME: ${{ secrets.MIN_VOLUME || '10000' }}
+        CYCLE_MINUTES: ${{ secrets.CYCLE_MINUTES || '15' }}
       run: python VPA.py
