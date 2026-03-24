@@ -30,4 +30,4 @@ jobs:
         MAX_PRICE: ${{ secrets.MAX_PRICE || '30.0' }}
         ALERT_THRESHOLD: ${{ secrets.ALERT_THRESHOLD || '5.0' }}
         MIN_VOLUME: ${{ secrets.MIN_VOLUME || '10000' }}
-      run: python vvpa.py
+      run: python VPA.py
