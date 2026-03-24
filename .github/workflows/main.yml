@@ -3,26 +3,39 @@ name: VVPA Auto-Scanner
 on:
   schedule:
     # Alle 15 Minuten während Marktzeiten (9:30-16:00 EST)
+    # 13:30-20:00 UTC entspricht 9:30-16:00 EST
     - cron: '*/15 13-20 * * 1-5'
   workflow_dispatch:
 
 jobs:
   vvpa-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
+    timeout-minutes: 14  # Muss unter 15 Min bleiben
     
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout repository
+      uses: actions/checkout@v3
     
     - name: Setup Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
+        cache: 'pip'
     
-    - name: Install deps
-      run: pip install aiohttp
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install aiohttp
     
-    - name: Run VVPA Cycle
+    - name: Debug - Show files
+      run: |
+        echo "Python files in repository:"
+        ls -la *.py 2>/dev/null || echo "No Python files found"
+        echo ""
+        echo "Repository structure:"
+        ls -la
+    
+    - name: Run VVPA Scanner
       env:
         POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -31,4 +44,4 @@ jobs:
         ALERT_THRESHOLD: ${{ secrets.ALERT_THRESHOLD || '5.0' }}
         MIN_VOLUME: ${{ secrets.MIN_VOLUME || '10000' }}
         CYCLE_MINUTES: ${{ secrets.CYCLE_MINUTES || '15' }}
-      run: python VVPA.py
+      run: python VPA.py
