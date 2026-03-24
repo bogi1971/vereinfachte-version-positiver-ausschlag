@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Biotech Price Alert Scanner v1.0
-Nur positive Ausbrüche, schnell & simpel
+VVPA - Volume & Volatility Price Alert
+Auto-Scan: Alle Biotech & Pharma Aktien < $30
+Zyklus: 15 Minuten
 """
 
 import os
@@ -9,13 +10,10 @@ import sys
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
 
 import aiohttp
-from dotenv import load_dotenv
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,13 +27,14 @@ class PriceAlert:
     symbol: str
     price: float
     change_pct: float
+    volume: int
     timestamp: datetime
 
 
-class PolygonPriceFetcher:
+class PolygonAPI:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "https://api.polygon.io/v2"
+        self.base_url = "https://api.polygon.io/v3"
         self._session: Optional[aiohttp.ClientSession] = None
         
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -43,51 +42,126 @@ class PolygonPriceFetcher:
             self._session = aiohttp.ClientSession()
         return self._session
     
-    async def fetch_batch(self, symbols: List[str]) -> Dict[str, PriceAlert]:
-        """Hole Preise für alle Symbole auf einmal (schneller!)"""
-        if not self.api_key:
-            logger.error("Kein POLYGON_API_KEY gesetzt!")
-            return {}
-        
-        # Polygon erlaubt bis zu 250 Symbole pro Call
+    async def get_biotech_pharma_tickers(self, max_price: float = 30.0) -> List[str]:
+        """Hole alle Biotech & Pharma Aktien unter max_price"""
         session = await self._get_session()
-        symbols_str = ",".join(symbols)
         
-        url = f"{self.base_url}/snapshot/locale/us/markets/stocks/tickers"
-        params = {
-            "tickers": symbols_str,
-            "apiKey": self.api_key
-        }
+        # Biotech & Pharma Tickers über Polygon Reference API
+        # Market: stocks, Type: CS (Common Stock)
+        all_tickers = []
         
-        try:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status != 200:
-                    logger.error(f"Polygon API Fehler: {resp.status}")
-                    return {}
-                
-                data = await resp.json()
-                results = {}
-                
-                for ticker_data in data.get("tickers", []):
-                    symbol = ticker_data.get("ticker", "")
-                    day_data = ticker_data.get("todaysChange", {})
+        # Biotech Sektoren
+        sectors = [
+            " Biotechnology",
+            "Pharmaceuticals", 
+            "Pharmaceutical Manufacturing",
+            "Medicinal Chemicals",
+            "Biological Products"
+        ]
+        
+        url = f"{self.base_url}/reference/tickers"
+        
+        for sector in sectors:
+            params = {
+                "market": "stocks",
+                "type": "CS",
+                "active": "true",
+                "limit": "1000",
+                "apiKey": self.api_key
+            }
+            
+            # Für bessere Filterung nutzen wir SIC Code oder GICS
+            # Da Polygon v3 keine direkte Sektorsuche hat, holen wir alle und filtern
+            
+            try:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        continue
                     
-                    price = ticker_data.get("lastTrade", {}).get("p", 0)
-                    change_pct = ticker_data.get("todaysChangePerc", 0)
+                    data = await resp.json()
+                    results = data.get("results", [])
                     
-                    if price > 0:
-                        results[symbol] = PriceAlert(
-                            symbol=symbol,
-                            price=price,
-                            change_pct=change_pct,
-                            timestamp=datetime.now(timezone.utc)
-                        )
-                
-                return results
-                
-        except Exception as e:
-            logger.error(f"Polygon Fetch Fehler: {e}")
+                    for ticker in results:
+                        symbol = ticker.get("ticker", "")
+                        if symbol and len(symbol) <= 5:  # Nur echte Tickers
+                            all_tickers.append(symbol)
+                    
+                    # Pagination
+                    next_url = data.get("next_url")
+                    while next_url and len(all_tickers) < 5000:
+                        next_url_with_key = f"{next_url}&apiKey={self.api_key}"
+                        async with session.get(next_url_with_key, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                            if resp.status != 200:
+                                break
+                            data = await resp.json()
+                            for ticker in data.get("results", []):
+                                symbol = ticker.get("ticker", "")
+                                if symbol and len(symbol) <= 5:
+                                    all_tickers.append(symbol)
+                            next_url = data.get("next_url")
+                            
+            except Exception as e:
+                logger.error(f"Fehler beim Laden der Tickers: {e}")
+        
+        # Entferne Duplikate
+        unique = list(dict.fromkeys(all_tickers))
+        logger.info(f"VVPA: {len(unique)} potentielle Biotech/Pharma Tickers gefunden")
+        return unique
+    
+    async def fetch_snapshot_filtered(self, symbols: List[str], max_price: float = 30.0) -> Dict[str, PriceAlert]:
+        """Hole Snapshot und filtere nach Preis < max_price"""
+        if not symbols:
             return {}
+        
+        session = await self._get_session()
+        
+        # Polygon erlaubt max 250 Tickers pro Call - aufteilen in Batches
+        batch_size = 250
+        all_results = {}
+        
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            symbols_str = ",".join(batch)
+            
+            url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+            params = {
+                "tickers": symbols_str,
+                "apiKey": self.api_key
+            }
+            
+            try:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Batch {i//batch_size + 1} Fehler: {resp.status}")
+                        continue
+                    
+                    data = await resp.json()
+                    
+                    for ticker_data in data.get("tickers", []):
+                        symbol = ticker_data.get("ticker", "")
+                        price = ticker_data.get("lastTrade", {}).get("p", 0)
+                        change_pct = ticker_data.get("todaysChangePerc", 0)
+                        volume = ticker_data.get("day", {}).get("v", 0)
+                        
+                        # Nur Aktien unter $30 und mit Preis > 0
+                        if 0.01 < price <= max_price and volume > 0:
+                            all_results[symbol] = PriceAlert(
+                                symbol=symbol,
+                                price=price,
+                                change_pct=change_pct,
+                                volume=int(volume),
+                                timestamp=datetime.now(timezone.utc)
+                            )
+                            
+            except Exception as e:
+                logger.error(f"Batch Fehler: {e}")
+            
+            # Rate limiting - kurze Pause zwischen Batches
+            if i + batch_size < len(symbols):
+                await asyncio.sleep(0.5)
+        
+        logger.info(f"VVPA: {len(all_results)} Aktien unter ${max_price} mit Daten")
+        return all_results
     
     async def close(self):
         if self._session and not self._session.closed:
@@ -108,12 +182,13 @@ class TelegramNotifier:
         return self._session
     
     async def send_alert(self, alert: PriceAlert):
-        """Sende Alert im Format aus deinem Screenshot"""
+        """Sende VVPA Alert"""
         msg = (
             f"🚀 <b>Positiver Ausbruch</b>\n\n"
             f"<b>{alert.symbol}</b>\n\n"
             f"Anstieg: <b>+{alert.change_pct:.2f}%</b>\n"
-            f"Preis: ${alert.price:.2f}\n\n"
+            f"Preis: ${alert.price:.2f}\n"
+            f"Volumen: {alert.volume:,}\n\n"
             f"📊 <a href='https://www.tradingview.com/chart/?symbol={alert.symbol}'>Chart öffnen</a>"
         )
         
@@ -133,18 +208,32 @@ class TelegramNotifier:
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     if resp.status == 200:
-                        logger.info(f"✅ Alert gesendet: {alert.symbol} +{alert.change_pct:.2f}%")
+                        logger.info(f"✅ VVPA: {alert.symbol} +{alert.change_pct:.2f}% @ ${alert.price:.2f}")
                         return True
                     else:
                         logger.error(f"Telegram Fehler: {resp.status}")
                         return False
             except Exception as e:
-                logger.error(f"Telegram Send Fehler: {e}")
+                logger.error(f"Telegram Fehler: {e}")
                 return False
     
-    async def send_heartbeat(self, hour: int):
-        """Stündlicher Heartbeat"""
-        msg = f"🕒 <b>Heartbeat</b> – Scanner läuft ({hour:02d}:00)"
+    async def send_summary(self, scan_time: float, total_stocks: int, alerts: int, top_movers: List[PriceAlert]):
+        """Sende Zusammenfassung nach jedem Scan"""
+        if not top_movers:
+            return
+            
+        top_3 = top_movers[:3]
+        movers_text = "\n".join([
+            f"• {a.symbol}: +{a.change_pct:.2f}% (${a.price:.2f})"
+            for a in top_3
+        ])
+        
+        msg = (
+            f"📊 <b>VVPA Scan #{self.scan_count}</b>\n"
+            f"⏱ {scan_time:.1f}s | 📈 {total_stocks} Stocks | 🚨 {alerts} Alerts\n\n"
+            f"<b>Top Mover:</b>\n{movers_text}"
+        )
+        
         payload = {
             'chat_id': self.chat_id,
             'text': msg,
@@ -161,14 +250,16 @@ class TelegramNotifier:
                 ) as resp:
                     return resp.status == 200
             except:
-                return False
+                pass
     
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
 
 
-class SimpleBreakoutScanner:
+class VVPAScanner:
+    """VVPA - Auto-Scan Biotech & Pharma < $30"""
+    
     def __init__(self):
         self.polygon_key = os.getenv('POLYGON_API_KEY')
         self.telegram_token = os.getenv('TELEGRAM_TOKEN')
@@ -179,137 +270,136 @@ class SimpleBreakoutScanner:
         if not self.telegram_token or not self.telegram_chat:
             raise ValueError("TELEGRAM_TOKEN oder TELEGRAM_CHAT_ID nicht gesetzt!")
         
-        self.price_fetcher = PolygonPriceFetcher(self.polygon_key)
+        self.api = PolygonAPI(self.polygon_key)
         self.telegram = TelegramNotifier(self.telegram_token, self.telegram_chat)
         
         # Konfiguration
-        self.threshold_pct = float(os.getenv('ALERT_THRESHOLD', '5.0'))  # 5% default
-        self.scan_interval = int(os.getenv('SCAN_INTERVAL_SEC', '30'))   # 30s default
-        self.ticker_file = os.getenv('TICKER_FILE', 'tickers.txt')
+        self.max_price = float(os.getenv('MAX_PRICE', '30.0'))
+        self.threshold_pct = float(os.getenv('ALERT_THRESHOLD', '5.0'))
+        self.cycle_minutes = int(os.getenv('CYCLE_MINUTES', '15'))
+        self.min_volume = int(os.getenv('MIN_VOLUME', '10000'))  # Mindestvolumen
         
         # Tracking
-        self.alerted_today: set = set()
-        self.alerted_prices: Dict[str, float] = {}
-        self.current_date = datetime.now(timezone.utc).date()
-        self.last_heartbeat = -1
+        self.alerted_stocks: Dict[str, datetime] = {}  # Wann wurde zuletzt alerted
+        self.all_tickers: List[str] = []
+        self.last_ticker_update = None
         
-    def load_tickers(self) -> List[str]:
-        """Lade Tickers aus Datei"""
-        import re
-        from pathlib import Path
+    async def update_ticker_list(self):
+        """Aktualisiere Ticker-Liste einmal pro Tag"""
+        now = datetime.now(timezone.utc)
         
-        path = Path(self.ticker_file)
-        if not path.exists():
-            # Default Biotech Liste
-            default = ["ABBV", "AMGN", "BIIB", "VRTX", "MRNA", "BNTX", "CRSP", 
-                      "GILD", "REGN", "VRTX", "SGEN", "ALNY", "INCY", "BMRN"]
-            path.write_text('\n'.join(default))
-            logger.info(f"Default Ticker-Liste erstellt: {self.ticker_file}")
-            return default
-        
-        content = path.read_text()
-        tickers = []
-        for line in content.splitlines():
-            line = line.strip().upper()
-            if line and not line.startswith('#') and re.match(r'^[A-Z]{1,5}$', line):
-                tickers.append(line)
-        
-        logger.info(f"{len(tickers)} Ticker geladen")
-        return list(dict.fromkeys(tickers))  # Remove duplicates
-    
-    def _reset_daily(self):
-        """Reset Alerts um Mitternacht"""
-        today = datetime.now(timezone.utc).date()
-        if today != self.current_date:
-            self.alerted_today.clear()
-            self.alerted_prices.clear()
-            self.current_date = today
-            logger.info("🌅 Neuer Tag - Alert-History zurückgesetzt")
+        if (self.last_ticker_update is None or 
+            (now - self.last_ticker_update).days >= 1 or 
+            not self.all_tickers):
+            
+            logger.info("VVPA: Lade Biotech & Pharma Ticker...")
+            self.all_tickers = await self.api.get_biotech_pharma_tickers()
+            self.last_ticker_update = now
+            logger.info(f"VVPA: {len(self.all_tickers)} Ticker im Universum")
     
     def _should_alert(self, alert: PriceAlert) -> bool:
         """Prüfe ob Alert gesendet werden soll"""
-        # Nur positive Bewegungen
+        # Threshold prüfen
         if alert.change_pct < self.threshold_pct:
             return False
         
-        symbol = alert.symbol
+        # Mindestvolumen
+        if alert.volume < self.min_volume:
+            return False
         
-        # Bereits heute alerted?
-        if symbol in self.alerted_today:
-            last_price = self.alerted_prices.get(symbol, 0)
-            if last_price > 0:
-                # Re-Alert nur bei +3% zusätzlich
-                additional_move = (alert.price - last_price) / last_price * 100
-                if additional_move < 3.0:
-                    return False
+        symbol = alert.symbol
+        now = datetime.now(timezone.utc)
+        
+        # Re-Alert nur nach 15 Minuten (ein Zyklus)
+        if symbol in self.alerted_stocks:
+            last_alert = self.alerted_stocks[symbol]
+            minutes_since = (now - last_alert).total_seconds() / 60
+            if minutes_since < self.cycle_minutes:
+                return False
         
         return True
     
-    async def run(self):
-        """Haupt-Loop"""
-        tickers = self.load_tickers()
+    async def run_cycle(self) -> dict:
+        """Ein kompletter Scan-Zyklus"""
+        start = datetime.now(timezone.utc)
         
-        logger.info("=" * 50)
-        logger.info("🚀 Simple Breakout Scanner gestartet")
+        # 1. Ticker-Liste aktualisieren (täglich)
+        await self.update_ticker_list()
+        
+        # 2. Preise holen & filtern
+        quotes = await self.api.fetch_snapshot_filtered(self.all_tickers, self.max_price)
+        
+        # 3. Alerts senden
+        alerts_sent = 0
+        alerts_list = []
+        
+        # Sortiere nach Change % (höchste zuerst)
+        sorted_quotes = sorted(quotes.values(), key=lambda x: x.change_pct, reverse=True)
+        
+        for alert in sorted_quotes:
+            if self._should_alert(alert):
+                success = await self.telegram.send_alert(alert)
+                if success:
+                    self.alerted_stocks[alert.symbol] = datetime.now(timezone.utc)
+                    alerts_sent += 1
+                    alerts_list.append(alert)
+        
+        # 4. Stats
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        positive = sum(1 for q in quotes.values() if q.change_pct > 0)
+        
+        logger.info(f"VVPA Cycle: {len(quotes)} stocks <${self.max_price}, {positive}↑, {alerts_sent} alerts | {elapsed:.1f}s")
+        
+        return {
+            'elapsed': elapsed,
+            'total': len(quotes),
+            'positive': positive,
+            'alerts': alerts_sent,
+            'top_movers': sorted_quotes[:10]
+        }
+    
+    async def run(self):
+        """Haupt-Loop - alle 15 Minuten"""
+        logger.info("=" * 60)
+        logger.info("🚀 VVPA Auto-Scanner gestartet")
+        logger.info(f"   Universum: Biotech & Pharma < ${self.max_price}")
         logger.info(f"   Threshold: +{self.threshold_pct}%")
-        logger.info(f"   Interval: {self.scan_interval}s")
-        logger.info(f"   Tickers: {len(tickers)}")
-        logger.info("=" * 50)
+        logger.info(f"   Zyklus: {self.cycle_minutes} Minuten")
+        logger.info(f"   Min Volume: {self.min_volume:,}")
+        logger.info("=" * 60)
+        
+        cycle_count = 0
         
         try:
             while True:
-                start = datetime.now(timezone.utc)
-                self._reset_daily()
+                cycle_count += 1
+                logger.info(f"\n--- VVPA Zyklus #{cycle_count} ---")
                 
-                # Heartbeat jede Stunde
-                current_hour = start.hour
-                if current_hour != self.last_heartbeat:
-                    await self.telegram.send_heartbeat(current_hour)
-                    self.last_heartbeat = current_hour
+                result = await self.run_cycle()
                 
-                # Preise holen (alle auf einmal - schnell!)
-                quotes = await self.price_fetcher.fetch_batch(tickers)
-                
-                # Alerts prüfen & senden
-                alerts_sent = 0
-                for symbol in tickers:
-                    if symbol not in quotes:
-                        continue
-                    
-                    alert = quotes[symbol]
-                    
-                    if self._should_alert(alert):
-                        success = await self.telegram.send_alert(alert)
-                        if success:
-                            self.alerted_today.add(symbol)
-                            self.alerted_prices[symbol] = alert.price
-                            alerts_sent += 1
-                
-                # Stats
-                elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-                positive = sum(1 for q in quotes.values() if q.change_pct > 0)
-                logger.info(f"Scan: {len(quotes)} quotes, {positive} positive, {alerts_sent} alerts | {elapsed:.1f}s")
-                
-                # Warte bis zum nächsten Scan
-                sleep_time = max(0, self.scan_interval - elapsed)
-                if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
+                # Warte bis zum nächsten Zyklus
+                sleep_seconds = self.cycle_minutes * 60 - result['elapsed']
+                if sleep_seconds > 0:
+                    logger.info(f"Nächster Zyklus in {sleep_seconds/60:.1f} Minuten...")
+                    await asyncio.sleep(sleep_seconds)
+                else:
+                    logger.warning("Zyklus dauerte länger als 15 Min!")
                     
         except asyncio.CancelledError:
-            logger.info("Scanner gestoppt")
+            logger.info("VVPA gestoppt")
         finally:
-            await self.price_fetcher.close()
+            await self.api.close()
             await self.telegram.close()
 
 
 async def main():
     try:
-        scanner = SimpleBreakoutScanner()
+        scanner = VVPAScanner()
         await scanner.run()
     except KeyboardInterrupt:
-        logger.info("Beendet durch Benutzer")
+        logger.info("VVPA beendet")
     except Exception as e:
-        logger.error(f"Fehler: {e}")
+        logger.error(f"VVPA Fehler: {e}")
         sys.exit(1)
 
 
