@@ -12,8 +12,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
-
-import aiohttp
+import aiohttp  # Korrigiert: aiiohttp -> aiohttp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,12 +46,11 @@ class PolygonAPI:
         session = await self._get_session()
         
         # Biotech & Pharma Tickers über Polygon Reference API
-        # Market: stocks, Type: CS (Common Stock)
         all_tickers = []
         
         # Biotech Sektoren
         sectors = [
-            " Biotechnology",
+            "Biotechnology",
             "Pharmaceuticals", 
             "Pharmaceutical Manufacturing",
             "Medicinal Chemicals",
@@ -70,9 +68,6 @@ class PolygonAPI:
                 "apiKey": self.api_key
             }
             
-            # Für bessere Filterung nutzen wir SIC Code oder GICS
-            # Da Polygon v3 keine direkte Sektorsuche hat, holen wir alle und filtern
-            
             try:
                 async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status != 200:
@@ -83,7 +78,7 @@ class PolygonAPI:
                     
                     for ticker in results:
                         symbol = ticker.get("ticker", "")
-                        if symbol and len(symbol) <= 5:  # Nur echte Tickers
+                        if symbol and len(symbol) <= 5:
                             all_tickers.append(symbol)
                     
                     # Pagination
@@ -175,13 +170,14 @@ class TelegramNotifier:
         self.base_url = f"https://api.telegram.org/bot{token}"
         self._session: Optional[aiohttp.ClientSession] = None
         self._lock = asyncio.Lock()
+        self.scan_count = 0  # Wichtig: Für send_summary benötigt
         
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
     
-    async def send_alert(self, alert: PriceAlert):
+    async def send_alert(self, alert: PriceAlert) -> bool:
         """Sende VVPA Alert"""
         msg = (
             f"🚀 <b>Positiver Ausbruch</b>\n\n"
@@ -219,6 +215,8 @@ class TelegramNotifier:
     
     async def send_summary(self, scan_time: float, total_stocks: int, alerts: int, top_movers: List[PriceAlert]):
         """Sende Zusammenfassung nach jedem Scan"""
+        self.scan_count += 1
+        
         if not top_movers:
             return
             
@@ -251,6 +249,7 @@ class TelegramNotifier:
                     return resp.status == 200
             except:
                 pass
+        return False
     
     async def close(self):
         if self._session and not self._session.closed:
@@ -277,10 +276,10 @@ class VVPAScanner:
         self.max_price = float(os.getenv('MAX_PRICE', '30.0'))
         self.threshold_pct = float(os.getenv('ALERT_THRESHOLD', '5.0'))
         self.cycle_minutes = int(os.getenv('CYCLE_MINUTES', '15'))
-        self.min_volume = int(os.getenv('MIN_VOLUME', '10000'))  # Mindestvolumen
+        self.min_volume = int(os.getenv('MIN_VOLUME', '10000'))
         
         # Tracking
-        self.alerted_stocks: Dict[str, datetime] = {}  # Wann wurde zuletzt alerted
+        self.alerted_stocks: Dict[str, datetime] = {}
         self.all_tickers: List[str] = []
         self.last_ticker_update = None
         
@@ -349,6 +348,10 @@ class VVPAScanner:
         positive = sum(1 for q in quotes.values() if q.change_pct > 0)
         
         logger.info(f"VVPA Cycle: {len(quotes)} stocks <${self.max_price}, {positive}↑, {alerts_sent} alerts | {elapsed:.1f}s")
+        
+        # 5. Zusammenfassung senden (nur wenn es Alerts gab)
+        if alerts_list:
+            await self.telegram.send_summary(elapsed, len(quotes), alerts_sent, sorted_quotes[:10])
         
         return {
             'elapsed': elapsed,
