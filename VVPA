@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""
+Biotech Price Alert Scanner v1.0
+Nur positive Ausbrüche, schnell & simpel
+"""
+
+import os
+import sys
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+
+import aiohttp
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PriceAlert:
+    symbol: str
+    price: float
+    change_pct: float
+    timestamp: datetime
+
+
+class PolygonPriceFetcher:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.polygon.io/v2"
+        self._session: Optional[aiohttp.ClientSession] = None
+        
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def fetch_batch(self, symbols: List[str]) -> Dict[str, PriceAlert]:
+        """Hole Preise für alle Symbole auf einmal (schneller!)"""
+        if not self.api_key:
+            logger.error("Kein POLYGON_API_KEY gesetzt!")
+            return {}
+        
+        # Polygon erlaubt bis zu 250 Symbole pro Call
+        session = await self._get_session()
+        symbols_str = ",".join(symbols)
+        
+        url = f"{self.base_url}/snapshot/locale/us/markets/stocks/tickers"
+        params = {
+            "tickers": symbols_str,
+            "apiKey": self.api_key
+        }
+        
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    logger.error(f"Polygon API Fehler: {resp.status}")
+                    return {}
+                
+                data = await resp.json()
+                results = {}
+                
+                for ticker_data in data.get("tickers", []):
+                    symbol = ticker_data.get("ticker", "")
+                    day_data = ticker_data.get("todaysChange", {})
+                    
+                    price = ticker_data.get("lastTrade", {}).get("p", 0)
+                    change_pct = ticker_data.get("todaysChangePerc", 0)
+                    
+                    if price > 0:
+                        results[symbol] = PriceAlert(
+                            symbol=symbol,
+                            price=price,
+                            change_pct=change_pct,
+                            timestamp=datetime.now(timezone.utc)
+                        )
+                
+                return results
+                
+        except Exception as e:
+            logger.error(f"Polygon Fetch Fehler: {e}")
+            return {}
+    
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+
+class TelegramNotifier:
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{token}"
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._lock = asyncio.Lock()
+        
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def send_alert(self, alert: PriceAlert):
+        """Sende Alert im Format aus deinem Screenshot"""
+        msg = (
+            f"🚀 <b>Positiver Ausbruch</b>\n\n"
+            f"<b>{alert.symbol}</b>\n\n"
+            f"Anstieg: <b>+{alert.change_pct:.2f}%</b>\n"
+            f"Preis: ${alert.price:.2f}\n\n"
+            f"📊 <a href='https://www.tradingview.com/chart/?symbol={alert.symbol}'>Chart öffnen</a>"
+        )
+        
+        payload = {
+            'chat_id': self.chat_id,
+            'text': msg,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True
+        }
+        
+        async with self._lock:
+            try:
+                session = await self._get_session()
+                async with session.post(
+                    f"{self.base_url}/sendMessage",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status == 200:
+                        logger.info(f"✅ Alert gesendet: {alert.symbol} +{alert.change_pct:.2f}%")
+                        return True
+                    else:
+                        logger.error(f"Telegram Fehler: {resp.status}")
+                        return False
+            except Exception as e:
+                logger.error(f"Telegram Send Fehler: {e}")
+                return False
+    
+    async def send_heartbeat(self, hour: int):
+        """Stündlicher Heartbeat"""
+        msg = f"🕒 <b>Heartbeat</b> – Scanner läuft ({hour:02d}:00)"
+        payload = {
+            'chat_id': self.chat_id,
+            'text': msg,
+            'parse_mode': 'HTML'
+        }
+        
+        async with self._lock:
+            try:
+                session = await self._get_session()
+                async with session.post(
+                    f"{self.base_url}/sendMessage",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    return resp.status == 200
+            except:
+                return False
+    
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+
+class SimpleBreakoutScanner:
+    def __init__(self):
+        self.polygon_key = os.getenv('POLYGON_API_KEY')
+        self.telegram_token = os.getenv('TELEGRAM_TOKEN')
+        self.telegram_chat = os.getenv('TELEGRAM_CHAT_ID')
+        
+        if not self.polygon_key:
+            raise ValueError("POLYGON_API_KEY nicht gesetzt!")
+        if not self.telegram_token or not self.telegram_chat:
+            raise ValueError("TELEGRAM_TOKEN oder TELEGRAM_CHAT_ID nicht gesetzt!")
+        
+        self.price_fetcher = PolygonPriceFetcher(self.polygon_key)
+        self.telegram = TelegramNotifier(self.telegram_token, self.telegram_chat)
+        
+        # Konfiguration
+        self.threshold_pct = float(os.getenv('ALERT_THRESHOLD', '5.0'))  # 5% default
+        self.scan_interval = int(os.getenv('SCAN_INTERVAL_SEC', '30'))   # 30s default
+        self.ticker_file = os.getenv('TICKER_FILE', 'tickers.txt')
+        
+        # Tracking
+        self.alerted_today: set = set()
+        self.alerted_prices: Dict[str, float] = {}
+        self.current_date = datetime.now(timezone.utc).date()
+        self.last_heartbeat = -1
+        
+    def load_tickers(self) -> List[str]:
+        """Lade Tickers aus Datei"""
+        import re
+        from pathlib import Path
+        
+        path = Path(self.ticker_file)
+        if not path.exists():
+            # Default Biotech Liste
+            default = ["ABBV", "AMGN", "BIIB", "VRTX", "MRNA", "BNTX", "CRSP", 
+                      "GILD", "REGN", "VRTX", "SGEN", "ALNY", "INCY", "BMRN"]
+            path.write_text('\n'.join(default))
+            logger.info(f"Default Ticker-Liste erstellt: {self.ticker_file}")
+            return default
+        
+        content = path.read_text()
+        tickers = []
+        for line in content.splitlines():
+            line = line.strip().upper()
+            if line and not line.startswith('#') and re.match(r'^[A-Z]{1,5}$', line):
+                tickers.append(line)
+        
+        logger.info(f"{len(tickers)} Ticker geladen")
+        return list(dict.fromkeys(tickers))  # Remove duplicates
+    
+    def _reset_daily(self):
+        """Reset Alerts um Mitternacht"""
+        today = datetime.now(timezone.utc).date()
+        if today != self.current_date:
+            self.alerted_today.clear()
+            self.alerted_prices.clear()
+            self.current_date = today
+            logger.info("🌅 Neuer Tag - Alert-History zurückgesetzt")
+    
+    def _should_alert(self, alert: PriceAlert) -> bool:
+        """Prüfe ob Alert gesendet werden soll"""
+        # Nur positive Bewegungen
+        if alert.change_pct < self.threshold_pct:
+            return False
+        
+        symbol = alert.symbol
+        
+        # Bereits heute alerted?
+        if symbol in self.alerted_today:
+            last_price = self.alerted_prices.get(symbol, 0)
+            if last_price > 0:
+                # Re-Alert nur bei +3% zusätzlich
+                additional_move = (alert.price - last_price) / last_price * 100
+                if additional_move < 3.0:
+                    return False
+        
+        return True
+    
+    async def run(self):
+        """Haupt-Loop"""
+        tickers = self.load_tickers()
+        
+        logger.info("=" * 50)
+        logger.info("🚀 Simple Breakout Scanner gestartet")
+        logger.info(f"   Threshold: +{self.threshold_pct}%")
+        logger.info(f"   Interval: {self.scan_interval}s")
+        logger.info(f"   Tickers: {len(tickers)}")
+        logger.info("=" * 50)
+        
+        try:
+            while True:
+                start = datetime.now(timezone.utc)
+                self._reset_daily()
+                
+                # Heartbeat jede Stunde
+                current_hour = start.hour
+                if current_hour != self.last_heartbeat:
+                    await self.telegram.send_heartbeat(current_hour)
+                    self.last_heartbeat = current_hour
+                
+                # Preise holen (alle auf einmal - schnell!)
+                quotes = await self.price_fetcher.fetch_batch(tickers)
+                
+                # Alerts prüfen & senden
+                alerts_sent = 0
+                for symbol in tickers:
+                    if symbol not in quotes:
+                        continue
+                    
+                    alert = quotes[symbol]
+                    
+                    if self._should_alert(alert):
+                        success = await self.telegram.send_alert(alert)
+                        if success:
+                            self.alerted_today.add(symbol)
+                            self.alerted_prices[symbol] = alert.price
+                            alerts_sent += 1
+                
+                # Stats
+                elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+                positive = sum(1 for q in quotes.values() if q.change_pct > 0)
+                logger.info(f"Scan: {len(quotes)} quotes, {positive} positive, {alerts_sent} alerts | {elapsed:.1f}s")
+                
+                # Warte bis zum nächsten Scan
+                sleep_time = max(0, self.scan_interval - elapsed)
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                    
+        except asyncio.CancelledError:
+            logger.info("Scanner gestoppt")
+        finally:
+            await self.price_fetcher.close()
+            await self.telegram.close()
+
+
+async def main():
+    try:
+        scanner = SimpleBreakoutScanner()
+        await scanner.run()
+    except KeyboardInterrupt:
+        logger.info("Beendet durch Benutzer")
+    except Exception as e:
+        logger.error(f"Fehler: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
