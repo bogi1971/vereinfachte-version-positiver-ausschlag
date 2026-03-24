@@ -2,38 +2,29 @@ name: VVPA Auto-Scanner
 
 on:
   schedule:
-    # Alle 15 Minuten während Marktzeiten (9:30-16:00 EST)
-    # 13:30-20:00 UTC entspricht 9:30-16:00 EST
-    - cron: '*/15 13-20 * * 1-5'
+    # Pre-Market: 4:00-9:30 EST (9:00-14:30 UTC)
+    - cron: '*/15 9-14 * * 1-5'
+    # Regular Market: 9:30-16:00 EST (14:30-20:00 UTC)
+    - cron: '*/15 14-20 * * 1-5'
+    # Post-Market: 16:00-20:00 EST (20:00-00:00 UTC)
+    - cron: '*/15 20-23 * * 1-5'
   workflow_dispatch:
 
 jobs:
   vvpa-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 14  # Muss unter 15 Min bleiben
+    timeout-minutes: 14
     
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
+    - uses: actions/checkout@v3
     
     - name: Setup Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
-        cache: 'pip'
     
     - name: Install dependencies
-      run: |
-        pip install --upgrade pip
-        pip install aiohttp
-    
-    - name: Debug - Show files
-      run: |
-        echo "Python files in repository:"
-        ls -la *.py 2>/dev/null || echo "No Python files found"
-        echo ""
-        echo "Repository structure:"
-        ls -la
+      run: pip install aiohttp
     
     - name: Run VVPA Scanner
       env:
