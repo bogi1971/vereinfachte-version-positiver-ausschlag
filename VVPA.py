@@ -3,6 +3,7 @@
 VVPA - Volume & Volatility Price Alert
 Auto-Scan: Alle Biotech & Pharma Aktien < $30
 Zyklus: 15 Minuten
+Unterstützt Pre-Market, Regular und Post-Market Stunden
 """
 
 import os
@@ -36,8 +37,8 @@ class PolygonAPI:
         self.api_key = api_key
         self.base_url = "https://api.polygon.io"
         self._session: Optional[aiohttp.ClientSession] = None
-        self.request_times = []  # Für Rate Limiting
-        self.cache = {}  # Cache für Ticker-Daten
+        self.request_times = []
+        self.cache = {}
         
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -48,7 +49,6 @@ class PolygonAPI:
     async def _rate_limit(self):
         """Rate Limiting für kostenlose API - 5 Anfragen pro Minute"""
         now = datetime.now()
-        # Entferne alte Anfragen (älter als 1 Minute)
         self.request_times = [t for t in self.request_times if (now - t).total_seconds() < 60]
         
         if len(self.request_times) >= 5:
@@ -63,8 +63,6 @@ class PolygonAPI:
     async def test_api_key(self) -> bool:
         """Testet ob der API-Key funktioniert"""
         session = await self._get_session()
-        
-        # Verwende einen einfachen Endpunkt der im kostenlosen Plan funktioniert
         url = f"{self.base_url}/v1/meta/symbols/AAPL/company"
         params = {"apiKey": self.api_key}
         
@@ -83,12 +81,10 @@ class PolygonAPI:
             return False
     
     async def get_biotech_pharma_tickers(self) -> List[str]:
-        """Hole Biotech & Pharma Aktien über die Reference API"""
-        session = await self._get_session()
-        
-        # Bekannte Biotech und Pharma Ticker (Fallback)
-        # Das sind die wichtigsten Small-Cap Biotech Aktien
-        known_tickers = [
+        """Hole Biotech & Pharma Aktien (vordefinierte Liste für kostenlose API)"""
+        # Umfangreiche Liste der wichtigsten Biotech und Pharma Aktien
+        # Fokussiert auf Small-Cap und Mid-Cap (< $30)
+        tickers = [
             "ABCL", "ABEO", "ABOS", "ABSI", "ABUS", "ACAD", "ACET", "ACHL", "ACIU", "ACLX",
             "ACOR", "ACRS", "ACST", "ACTG", "ADAG", "ADAP", "ADCT", "ADIL", "ADMA", "ADMP",
             "ADPT", "ADRT", "ADTX", "AEON", "AEZS", "AFMD", "AGEN", "AGIO", "AGLE", "AGPH",
@@ -737,8 +733,8 @@ class PolygonAPI:
             "ZWIN", "ZY", "ZYME", "ZYNE", "ZYXI", "ZZLL"
         ]
         
-        logger.info(f"Verwende vordefinierte Liste mit {len(known_tickers)} Biotech/Pharma Tickers")
-        return known_tickers
+             logger.info(f"Verwende vordefinierte Liste mit {len(tickers)} Biotech/Pharma Tickers")
+        return tickers
     
     async def fetch_snapshot_filtered(self, symbols: List[str], max_price: float = 30.0) -> Dict[str, PriceAlert]:
         """Hole Preise für Tickers mit kostenloser API"""
@@ -767,7 +763,7 @@ class PolygonAPI:
                         
                         if results:
                             result = results[0]
-                            price = result.get("c", 0)  # Closing price
+                            price = result.get("c", 0)
                             volume = result.get("v", 0)
                             open_price = result.get("o", price)
                             
@@ -786,7 +782,6 @@ class PolygonAPI:
                                 )
                                 successful += 1
                     elif resp.status == 404:
-                        # Ticker existiert nicht oder hat keine Daten
                         failed += 1
                     else:
                         failed += 1
@@ -800,7 +795,6 @@ class PolygonAPI:
                 failed += 1
                 logger.debug(f"Fehler bei {symbol}: {e}")
             
-            # Fortschrittsanzeige alle 100 Ticker
             if (idx + 1) % 100 == 0:
                 logger.info(f"Fortschritt: {idx + 1}/{len(symbols)} | Gefunden: {successful}")
         
@@ -910,7 +904,39 @@ class TelegramNotifier:
             f"🚀 <b>VVPA Scanner gestartet</b>\n\n"
             f"📊 Sucht nach Biotech & Pharma Aktien < $30\n"
             f"🎯 Alert bei +5% oder mehr\n"
-            f"⏱ Scan alle 15 Minuten während Marktzeiten"
+            f"⏱ Scan alle 15 Minuten während Marktzeiten\n\n"
+            f"🕐 Marktzeiten EST:\n"
+            f"   Pre-Market: 4:00-9:30\n"
+            f"   Regular: 9:30-16:00\n"
+            f"   Post-Market: 16:00-20:00"
+        )
+        
+        payload = {
+            'chat_id': self.chat_id,
+            'text': msg,
+            'parse_mode': 'HTML'
+        }
+        
+        async with self._lock:
+            try:
+                session = await self._get_session()
+                async with session.post(
+                    f"{self.base_url}/sendMessage",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    return resp.status == 200
+            except:
+                pass
+        return False
+    
+    async def send_market_open_message(self):
+        """Sende Nachricht wenn Markt öffnet"""
+        msg = (
+            f"🔔 <b>Markt ist geöffnet!</b>\n\n"
+            f"VVPA Scanner aktiv\n"
+            f"📊 Überwache Biotech & Pharma Aktien < $30\n"
+            f"🎯 Alerts bei +{os.getenv('ALERT_THRESHOLD', '5.0')}% oder mehr"
         )
         
         payload = {
@@ -938,7 +964,7 @@ class TelegramNotifier:
 
 
 class VVPAScanner:
-    """VVPA - Auto-Scan Biotech & Pharma < $30"""
+    """VVPA - Auto-Scan Biotech & Pharma < $30 mit Pre-Market Unterstützung"""
     
     def __init__(self):
         self.polygon_key = os.getenv('POLYGON_API_KEY')
@@ -964,11 +990,63 @@ class VVPAScanner:
         self.all_tickers: List[str] = []
         self.last_ticker_update = None
         
+    def is_market_hours(self) -> bool:
+        """Prüft ob gerade Marktzeiten sind (Pre-Market, Regular, Post-Market)"""
+        now = datetime.now(timezone.utc)
+        
+        # In EST umrechnen (UTC-4 oder UTC-5)
+        # Für die Sommerzeit-Erkennung: März bis November = UTC-4, sonst UTC-5
+        is_dst = now.month > 3 and now.month < 11
+        utc_offset = 4 if is_dst else 5
+        
+        est_hour = now.hour - utc_offset
+        if est_hour < 0:
+            est_hour += 24
+        
+        est_minute = now.minute
+        current_time = est_hour + (est_minute / 60)
+        
+        # Marktzeiten in EST
+        pre_market_start = 4.0    # 4:00
+        regular_open = 9.5        # 9:30
+        regular_close = 16.0      # 16:00
+        post_market_end = 20.0    # 20:00
+        
+        # Prüfe ob in Pre-Market, Regular oder Post-Market
+        if (pre_market_start <= current_time < regular_open) or \
+           (regular_open <= current_time < regular_close) or \
+           (regular_close <= current_time < post_market_end):
+            return True
+        
+        return False
+    
+    def get_market_session(self) -> str:
+        """Gibt die aktuelle Marktsitzung zurück"""
+        now = datetime.now(timezone.utc)
+        
+        is_dst = now.month > 3 and now.month < 11
+        utc_offset = 4 if is_dst else 5
+        
+        est_hour = now.hour - utc_offset
+        if est_hour < 0:
+            est_hour += 24
+        
+        est_minute = now.minute
+        current_time = est_hour + (est_minute / 60)
+        
+        if 4.0 <= current_time < 9.5:
+            return "Pre-Market"
+        elif 9.5 <= current_time < 16.0:
+            return "Regular Market"
+        elif 16.0 <= current_time < 20.0:
+            return "Post-Market"
+        else:
+            return "Closed"
+    
     async def update_ticker_list(self):
         """Aktualisiere Ticker-Liste einmal pro Woche"""
         now = datetime.now(timezone.utc)
         
-        # Update einmal pro Woche
         if (self.last_ticker_update is None or 
             (now - self.last_ticker_update).days >= 7 or 
             not self.all_tickers):
@@ -980,18 +1058,15 @@ class VVPAScanner:
     
     def _should_alert(self, alert: PriceAlert) -> bool:
         """Prüfe ob Alert gesendet werden soll"""
-        # Threshold prüfen
         if alert.change_pct < self.threshold_pct:
             return False
         
-        # Mindestvolumen
         if alert.volume < self.min_volume:
             return False
         
         symbol = alert.symbol
         now = datetime.now(timezone.utc)
         
-        # Re-Alert nur nach 15 Minuten (ein Zyklus)
         if symbol in self.alerted_stocks:
             last_alert = self.alerted_stocks[symbol]
             minutes_since = (now - last_alert).total_seconds() / 60
@@ -1004,7 +1079,13 @@ class VVPAScanner:
         """Ein kompletter Scan-Zyklus"""
         start = datetime.now(timezone.utc)
         
-        # 1. Ticker-Liste aktualisieren (wöchentlich)
+        # Prüfe Marktzeiten
+        if not self.is_market_hours():
+            market_session = self.get_market_session()
+            logger.info(f"Außerhalb der Marktzeiten ({market_session}). Warte...")
+            return {'elapsed': 0, 'total': 0, 'positive': 0, 'alerts': 0, 'top_movers': []}
+        
+        # 1. Ticker-Liste aktualisieren
         await self.update_ticker_list()
         
         if not self.all_tickers:
@@ -1018,7 +1099,6 @@ class VVPAScanner:
         alerts_sent = 0
         alerts_list = []
         
-        # Sortiere nach Change % (höchste zuerst)
         sorted_quotes = sorted(quotes.values(), key=lambda x: x.change_pct, reverse=True)
         
         for alert in sorted_quotes:
@@ -1033,9 +1113,10 @@ class VVPAScanner:
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         positive = sum(1 for q in quotes.values() if q.change_pct > 0)
         
-        logger.info(f"VVPA Cycle: {len(quotes)} stocks <${self.max_price}, {positive}↑, {alerts_sent} alerts | {elapsed:.1f}s")
+        market_session = self.get_market_session()
+        logger.info(f"VVPA Cycle [{market_session}]: {len(quotes)} stocks <${self.max_price}, {positive}↑, {alerts_sent} alerts | {elapsed:.1f}s")
         
-        # 5. Zusammenfassung senden (nur wenn es Alerts gab)
+        # 5. Zusammenfassung senden
         if alerts_list:
             await self.telegram.send_summary(elapsed, len(quotes), alerts_sent, sorted_quotes[:10])
         
@@ -1048,13 +1129,14 @@ class VVPAScanner:
         }
     
     async def run(self):
-        """Haupt-Loop - alle 15 Minuten"""
+        """Haupt-Loop - alle 15 Minuten mit Pre-Market Unterstützung"""
         logger.info("=" * 60)
         logger.info("🚀 VVPA Auto-Scanner gestartet")
         logger.info(f"   Universum: Biotech & Pharma < ${self.max_price}")
         logger.info(f"   Threshold: +{self.threshold_pct}%")
         logger.info(f"   Zyklus: {self.cycle_minutes} Minuten")
         logger.info(f"   Min Volume: {self.min_volume:,}")
+        logger.info(f"   Marktzeiten EST: Pre-Market (4:00-9:30), Regular (9:30-16:00), Post-Market (16:00-20:00)")
         logger.info("=" * 60)
         
         # Teste API-Key
@@ -1067,11 +1149,25 @@ class VVPAScanner:
         await self.telegram.send_startup_message()
         
         cycle_count = 0
+        last_market_status = None
         
         try:
             while True:
                 cycle_count += 1
-                logger.info(f"\n--- VVPA Zyklus #{cycle_count} ---")
+                
+                # Prüfe Marktstatus
+                current_market_status = self.is_market_hours()
+                market_session = self.get_market_session()
+                
+                if current_market_status and last_market_status != "open":
+                    logger.info(f"🔔 Markt ist jetzt geöffnet ({market_session})")
+                    await self.telegram.send_market_open_message()
+                    last_market_status = "open"
+                elif not current_market_status and last_market_status != "closed":
+                    logger.info(f"⏸ Markt ist geschlossen ({market_session})")
+                    last_market_status = "closed"
+                
+                logger.info(f"\n--- VVPA Zyklus #{cycle_count} [{market_session}] ---")
                 
                 result = await self.run_cycle()
                 
