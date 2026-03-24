@@ -35,4 +35,4 @@ jobs:
         ALERT_THRESHOLD: ${{ secrets.ALERT_THRESHOLD || '5.0' }}
         MIN_VOLUME: ${{ secrets.MIN_VOLUME || '10000' }}
         CYCLE_MINUTES: ${{ secrets.CYCLE_MINUTES || '15' }}
-      run: python VPA.py
+      run: python VVPA.py
